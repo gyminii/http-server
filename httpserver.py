@@ -1,5 +1,39 @@
 import threading
 import socket
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
+# Basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('server.log'),  # Write to file
+        logging.StreamHandler()  # Also print to console
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+def parse_query_params(path):
+    """
+    Extract query parameters from path
+    Example: /api/users?limit=10&offset=20
+    Returns: ('/api/users', {'limit': '10', 'offset': '20'})
+    """
+    if '?' not in path:
+        return path, {}
+
+    path_part, query_string = path.split('?', 1)
+    params = {}
+
+    # Split by & to get key=value pairs
+    for pair in query_string.split('&'):
+        if '=' in pair:
+            key, value = pair.split('=', 1)
+            params[key] = value
+
+    return path_part, params
 
 def parse_request(request):
     """
@@ -38,31 +72,17 @@ def parse_request(request):
 
     return method, path, headers, body
 
+def route(method, path, headers, body,query_params):
 
-def handle_request(request):
-    """Handles the HTTP request."""
+    if method == "GET" and path == "/api/users":
+        limit = query_params.get('limit', '10')
+        offset = query_params.get('offset', '0')
+        return json_response({
+            'users': [],
+            'limit': limit,
+            'offset': offset
+        })
 
-    headers = request.split('\n')
-    filename = headers[0].split()[1]
-    if filename == '/':
-        filename = '/index.html'
-
-    try:
-        fin = open('htdocs' + filename)
-        content = fin.read()
-        fin.close()
-
-        # response = 'HTTP/1.0 200 OK\n\n' + content
-        response = 'HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n' + content
-    except FileNotFoundError:
-        response = 'HTTP/1.0 404 NOT FOUND\n\nFile Not Found'
-
-    return response
-
-def route(method, path, headers, body):
-    """
-    Route HTTP request to appropriate handler based on method and path
-    """
     # GET req for home
     if method == "GET" and path in ["/", "/index.html"]:
         return serve_file('index.html')
@@ -80,35 +100,69 @@ def route(method, path, headers, body):
     if method == 'POST' and path == '/api/echo':
         return json_response({'received': body, 'method': 'POST'})
 
+    # PUT request - update resource
+    if method == 'PUT' and path.startswith('/api/'):
+        return json_response({'message': 'Resource updated', 'method': 'PUT', 'path': path})
+
+    # DELETE request
+    if method == 'DELETE' and path.startswith('/api/'):
+        return json_response({'message': 'Resource deleted', 'method': 'DELETE', 'path': path})
+
+    # PATCH request - partial update
+    if method == 'PATCH' and path.startswith('/api/'):
+        return json_response({'message': 'Resource partially updated', 'method': 'PATCH', 'path': path})
+
     # No matching route found
     return error_response(404, 'Not Found')
 
+# Helper function to get the content types
+def get_content_type(filename):
+    """Determine MIME type based on file extension"""
+    if filename.endswith('.html'):
+        return 'text/html'
+    elif filename.endswith('.css'):
+        return 'text/css'
+    elif filename.endswith('.js'):
+        return 'application/javascript'
+    elif filename.endswith('.json'):
+        return 'application/json'
+    elif filename.endswith('.png'):
+        return 'image/png'
+    elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
+        return 'image/jpeg'
+    elif filename.endswith('.gif'):
+        return 'image/gif'
+    else:
+        return 'application/octet-stream'  # Generic binary
+
 def serve_file(filename):
-    """
-    Read file from htdocs directory and return as HTTP response
-    Returns 404 if file doesn't exist
-    """
     filepath = f'htdocs/{filename}'
 
+    # Images need to be read as binary, text files as text
+    is_binary = filename.endswith(('.png', '.jpg', '.jpeg', '.gif'))
+    mode = 'rb' if is_binary else 'r'
+
     try:
-        with open(filepath, 'r') as file:
+        with open(filepath, mode) as file:
             content = file.read()
     except FileNotFoundError:
         return error_response(404, 'File Not Found')
 
-    # Build HTTP response with proper headers
+    content_type = get_content_type(filename)
+
+    # Build response headers
     response = 'HTTP/1.0 200 OK\r\n'
-    response += 'Content-Type: text/html\r\n'
+    response += f'Content-Type: {content_type}\r\n'
     response += 'Connection: close\r\n'
     response += '\r\n'
-    response += content
 
-    return response
+    # If binary file, return bytes. Otherwise, return string
+    if is_binary:
+        return response.encode() + content
+    else:
+        return response + content
 
 def json_response(data):
-    """
-    Convert Python dictionary to JSON and return as HTTP response
-    """
     import json
 
     json_body = json.dumps(data)
@@ -122,9 +176,6 @@ def json_response(data):
     return response
 
 def error_response(status_code, message):
-    """
-    Return an HTTP error response with given status code and message
-    """
     response = f"HTTP/1.0 {status_code} {message}\r\n"
     response += 'Content-Type: text/plain\r\n'
     response += 'Connection: close\r\n'
@@ -133,25 +184,70 @@ def error_response(status_code, message):
 
     return response
 
+
 def handle_client(c_connection, c_address):
     """Handle a single client connection"""
     try:
-        request = c_connection.recv(1024).decode()
-        print(f"Request from {c_address}:\n{request}")
-        # Parse request
-        method, path, headers, body = parse_request(request)
-        print(f"Method: {method}, Path: {path}")
-        # print(f"Headers: {headers}")
-        # if body:
-        #     print(f"Body: {body}\n")
-        # Routing ot appropriate handler
-        response = route(method, path, headers, body)
-        # Sending response back
+
+        c_connection.settimeout(10.0)
+
+        # Keep reading until we have the complete headers
+        # Headers end with \r\n\r\n (blank line)
+        request_data = b''
+        while b'\r\n\r\n' not in request_data:
+            chunk = c_connection.recv(1024)
+            if not chunk:
+                # Client disconnected before sending complete headers
+                return
+            request_data += chunk
+
+        # Split the headers from any body data that already arrived
+        # Sometimes the body comes in the same packet as headers
+        header_end = request_data.index(b'\r\n\r\n')
+        headers_part = request_data[:header_end].decode()
+        body_bytes = request_data[header_end + 4:]  # +4 to skip the \r\n\r\n
+
+        # Parse headers to find out how much body to expect
+        method, path, headers, _ = parse_request(headers_part + '\r\n\r\n')
+
+        # Parse query parameters
+        path, query_params = parse_query_params(path)
+
+        content_length = int(headers.get('Content-Length', 0))
+
+        # Keep reading until we have all the body bytes
+        # body_bytes might already have some data from the first recv()
+        while len(body_bytes) < content_length:
+            chunk = c_connection.recv(1024)
+            if not chunk:
+                # Connection closed before we got all the data
+                break
+            body_bytes += chunk
+
+        # Convert bytes to string
+        body = body_bytes.decode() if body_bytes else ''
+
+        # Logging the request
+        logger.info(f"{c_address[0]} - {method} {path} - Query: {query_params}")
+
+        # Route to appropriate handler
+        response = route(method, path, headers, body, query_params)
+
+        # Send response back
         c_connection.sendall(response.encode())
         c_connection.shutdown(socket.SHUT_WR)
+
+        logger.info(f"{c_address[0]} - Request completed successfully")
+
+
+    except socket.timeout:
+        logger.warning(f"{c_address[0]} - Connection timed out")
+        return
+    except Exception as e:
+        logger.error(f"{c_address[0]} - Error: {str(e)}", exc_info=True)
+        return
     finally:
         c_connection.close()
-
 
 # Define socket host and port
 SERVER_HOST = '0.0.0.0'
@@ -173,24 +269,22 @@ server_socket.bind((SERVER_HOST, SERVER_PORT))
 server_socket.listen(5)
 print('Listening on port %s ...' % SERVER_PORT)
 
-
+# thread pool
+WORKERS=20
+thread_pool = ThreadPoolExecutor(max_workers=WORKERS)
 
 try:
     while True:
         # Wait for client connections
         client_connection, client_address = server_socket.accept()
-        print(f"Connection from {client_address}")
+        logger.info(f"New connection from {client_address}")
 
-        # Concurrency
-        thread = threading.Thread(
-            target=handle_client,
-            args=(client_connection, client_address)
-        )
-        thread.daemon = True
-        thread.start()
+        # Submit connection to thread pool instead of creating new thread
+        # If all 20 threads are busy, this waits until one becomes free
+        #
+        thread_pool.submit(handle_client, client_connection, client_address)
 
 except KeyboardInterrupt:
-    print("\nShutting down...")
+    logger.info("Shutting down server...")
+    thread_pool.shutdown(wait=True)
     server_socket.close()
-
-
